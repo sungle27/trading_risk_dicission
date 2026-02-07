@@ -1,0 +1,4 @@
+app = "trading-risk-decission"
+
+[processes]
+worker = "python -m app.main"
