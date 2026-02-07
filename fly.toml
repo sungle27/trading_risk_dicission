@@ -1,4 +1,12 @@
 app = "trading-risk-decission"
+primary_region = "nrt"
+
+[build]
 
 [processes]
 worker = "python -m app.main"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
