@@ -2,17 +2,31 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
 
 # ============================================================
-# Load .env (AUTO, SAFE)
+# Load .env (ROBUST, CROSS-PLATFORM)
 # ============================================================
 try:
-    from dotenv import load_dotenv, find_dotenv  # type: ignore
-    load_dotenv(find_dotenv(), override=True)
-except Exception:
-    pass
+    from dotenv import load_dotenv  # type: ignore
+
+    # project_root/app/config.py → project_root/.env
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    ENV_PATH = PROJECT_ROOT / ".env"
+
+    if ENV_PATH.exists():
+        load_dotenv(ENV_PATH, override=True)
+    else:
+        print(f"[WARN] .env not found at {ENV_PATH}")
+
+except Exception as e:
+    print(f"[WARN] dotenv load failed: {e}")
 
 
+# ============================================================
+# Helpers (STRICT)
+# ============================================================
 def _require(key: str) -> str:
     val = os.getenv(key)
     if val is None or val.strip() == "":
@@ -28,9 +42,12 @@ def _f(key: str) -> float:
     return float(_require(key))
 
 
+# ============================================================
+# CONFIG
+# ============================================================
 @dataclass(frozen=True)
 class Config:
-    # core
+    # ================= CORE =================
     BINANCE_FUTURES_WS: str = _require("BINANCE_FUTURES_WS")
 
     TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
@@ -39,20 +56,20 @@ class Config:
     DEBUG_ENABLED: int = _i("DEBUG_ENABLED")
     HEARTBEAT_SEC: int = _i("HEARTBEAT_SEC")
 
-    # EMA + regime gap
+    # ================= EMA / REGIME =================
     EMA_FAST: int = _i("EMA_FAST")
     EMA_SLOW: int = _i("EMA_SLOW")
 
     REGIME_EMA_GAP_EARLY: float = _f("REGIME_EMA_GAP_EARLY")
-    REGIME_EMA_GAP_MAIN: float = _f("REGIME_EMA_GAP")  # env key
+    REGIME_EMA_GAP_MAIN: float = _f("REGIME_EMA_GAP")
 
-    # volume
+    # ================= VOLUME =================
     VOLUME_SMA_LEN: int = _i("VOLUME_SMA_LEN")
     VOLUME_RATIO_EARLY: float = _f("VOLUME_RATIO_EARLY")
     VOLUME_RATIO_MAIN: float = _f("VOLUME_RATIO_MAIN")
     ENABLE_VOLUME: int = _i("ENABLE_VOLUME")
 
-    # spread
+    # ================= SPREAD =================
     ENABLE_SPREAD: int = _i("ENABLE_SPREAD")
     SPREAD_MAX: float = _f("SPREAD_MAX")
 
@@ -60,11 +77,11 @@ class Config:
     SPREAD_MAX_EARLY: float = _f("SPREAD_MAX_EARLY")
     SPREAD_MAX_MAIN: float = _f("SPREAD_MAX_MAIN")
 
-    # cooldown
+    # ================= COOLDOWN =================
     COOLDOWN_SEC_EARLY: int = _i("COOLDOWN_SEC_EARLY")
     COOLDOWN_SEC_MAIN: int = _i("COOLDOWN_SEC_MAIN")
 
-    # filters
+    # ================= FILTERS =================
     ENABLE_ANTI_TRAP: int = _i("ENABLE_ANTI_TRAP")
 
     ENABLE_FOLLOW_THROUGH: int = _i("ENABLE_FOLLOW_THROUGH")
@@ -79,13 +96,13 @@ class Config:
     MOMENTUM_MIN_EARLY: float = _f("MOMENTUM_MIN_EARLY")
     MOMENTUM_MIN_MAIN: float = _f("MOMENTUM_MIN_MAIN")
 
-    # ATR compression
+    # ================= ATR COMPRESSION =================
     ENABLE_ATR_COMPRESSION: int = _i("ENABLE_ATR_COMPRESSION")
     ATR_SHORT: int = _i("ATR_SHORT")
     ATR_LONG: int = _i("ATR_LONG")
     ATR_COMPRESSION_RATIO: float = _f("ATR_COMPRESSION_RATIO")
 
-    # Decision/Risk: Market regime
+    # ================= MARKET REGIME =================
     ENABLE_MARKET_REGIME: int = _i("ENABLE_MARKET_REGIME")
     REGIME_PROXY_1: str = _require("REGIME_PROXY_1")
     REGIME_PROXY_2: str = _require("REGIME_PROXY_2")
@@ -100,9 +117,17 @@ class Config:
     REGIME_MIN_HOLD_SEC: int = _i("REGIME_MIN_HOLD_SEC")
     REGIME_ALERT_COOLDOWN_SEC: int = _i("REGIME_ALERT_COOLDOWN_SEC")
 
-    # Alert modes
+    # ================= ALERT MODES =================
     ALERT_MODE_DECISION: int = _i("ALERT_MODE_DECISION")
     ALERT_MODE_EXECUTION: int = _i("ALERT_MODE_EXECUTION")
 
+       # ====================================================
+    # CAPITAL / RISK MANAGEMENT
+    # ====================================================
+    NAV_USD: float = _f("NAV_USD")
 
+    MAX_POSITIONS: int = _i("MAX_POSITIONS")
+    MAX_TOTAL_RISK_PCT: float = _f("MAX_TOTAL_RISK_PCT")
+
+    RISK_PER_TRADE_PCT: float = _f("RISK_PER_TRADE_PCT")
 CFG = Config()
