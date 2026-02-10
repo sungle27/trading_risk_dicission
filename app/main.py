@@ -32,6 +32,18 @@ LAST_REGIME = None
 # ============================================================
 # Position Manager (GLOBAL)
 # ============================================================
+class PositionManager:
+    def __init__(
+        self,
+        nav_usd: float,
+        max_positions: int,
+        max_total_risk_pct: float,
+    ):
+        self.nav_usd = nav_usd
+        self.max_positions = max_positions
+        self.max_total_risk_pct = max_total_risk_pct
+        self.positions = {}
+
 pos_mgr = PositionManager(
     nav_usd=CFG.NAV_USD,
     max_positions=CFG.MAX_POSITIONS,
