@@ -131,3 +131,12 @@ class Config:
 
     RISK_PER_TRADE_PCT: float = _f("RISK_PER_TRADE_PCT")
 CFG = Config()
+
+# ================= Liquidity =================
+MIN_LIQUIDITY_USD: float = _f("MIN_LIQUIDITY_USD")
+
+# ================= Volatility sizing =================
+TARGET_VOL_PCT: float = _f("TARGET_VOL_PCT")
+
+# ================= Correlation =================
+MAX_CORRELATION: float = _f("MAX_CORRELATION")
