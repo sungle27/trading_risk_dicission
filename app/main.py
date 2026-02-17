@@ -34,7 +34,7 @@ LAST_REGIME: Optional[str] = None
 # SIM SETTINGS
 # ============================================================
 SIM_ENABLED = bool(int(getattr(CFG, "SIM_ENABLED", 1)))
-SIM_START_NAV = float(getattr(CFG, "SIM_START_NAV", 1000.0))
+SIM_START_NAV = float(getattr(CFG, "SIM_START_NAV", 10000.0))
 SIM_RR = float(getattr(CFG, "SIM_RR", 2.0))
 
 # If True: bot will only open trades in MAIN timeframe (15m)
@@ -224,6 +224,24 @@ def compute_atr(candles: List[dict], period: int) -> Optional[float]:
         atr_val = atr.update(float(c["high"]), float(c["low"]), float(c["close"]))
     return atr_val
 
+
+# ============================================================
+# NAV MONITOR (hourly)
+# ============================================================
+async def nav_monitor():
+    while True:
+        await asyncio.sleep(60 * 60)  # 1 hour
+
+        total_risk = pos_mgr.total_risk_usd() if hasattr(pos_mgr, "total_risk_usd") else 0.0
+        open_positions = len(sim.positions) if SIM_ENABLED else 0
+
+        await send_telegram(
+            f"📊 SIM STATUS (Hourly)\n"
+            f"NAV: {sim.nav:.2f} USDT\n"
+            f"Open positions: {open_positions}\n"
+            f"Total risk: {total_risk:.2f} USDT\n"
+            f"Regime: {MARKET_REGIME}"
+        )
 
 # ============================================================
 # WS: AGG TRADE (engine)
@@ -428,6 +446,7 @@ async def main():
     await asyncio.gather(
         ws_bookticker(states, url_book),
         ws_aggtrade(states, url_trade),
+        nav_monitor(),  # 👈 thêm dòng này
     )
 
 
