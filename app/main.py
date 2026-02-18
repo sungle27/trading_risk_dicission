@@ -141,7 +141,7 @@ class SymbolState:
 
         # decision TFs
         self.r5m = TimeframeResampler(5 * 60)     # EARLY
-        self.r15m = TimeframeResampler(15 * 60)   # MAIN
+        self.r15m = TimeframeResampler(1 * 60)   # MAIN
 
         # history
         self.candles_5m: List[dict] = []
