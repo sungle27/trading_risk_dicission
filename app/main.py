@@ -421,16 +421,18 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 )
                                                 pos_mgr.update_nav(sim.nav)
                                                 await send_telegram("DEBUG: OPEN CALLED 2222")
-                                            tp_str = f"{rp.tp:.6f}" if rp.tp is not None else "None"
+                                                tp_str = f"{rp.tp:.6f}" if rp.tp is not None else "None"
+                                                await send_telegram("DEBUG: OPEN CALLED 333")
 
-                                            await send_telegram(
-                                                f"🟢 OPEN {sig['direction']} {sym}\n"
-                                                f"Entry: {rp.entry:.6f}\n"
-                                                f"Qty: {rp.qty:.4f}\n"
-                                                f"SL: {rp.sl:.6f}\n"
-                                                f"TP: {tp_str}\n"
-                                                f"NAV: {sim.nav:.2f} USDT"
-                                            )
+                                                await send_telegram(
+                                                    f"🟢 OPEN {sig['direction']} {sym}\n"
+                                                    f"Entry: {rp.entry:.6f}\n"
+                                                    f"Qty: {rp.qty:.4f}\n"
+                                                    f"SL: {rp.sl:.6f}\n"
+                                                    f"TP: {tp_str}\n"
+                                                    f"NAV: {sim.nav:.2f} USDT"
+                                                )
+                                                await send_telegram("DEBUG: OPEN CALLED 444")
 
                                 st.vol_bucket = 0.0
 
