@@ -420,7 +420,7 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                     price_history=[c["close"] for c in st.candles_15m[-60:]],
                                                 )
                                                 pos_mgr.update_nav(sim.nav)
-
+                                                await send_telegram("DEBUG: OPEN CALLED 2222")
                                             tp_str = f"{rp.tp:.6f}" if rp.tp is not None else "None"
 
                                             await send_telegram(
