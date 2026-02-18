@@ -108,7 +108,7 @@ def score_signal(
     # ========================================================
     # BREAKOUT LEVEL (High/Low 20)
     # ========================================================
-    breakout_ok = breakout_level(candles, 5)
+    breakout_ok = breakout_level(candles, 20)
     reasons["breakout_highlow"] = breakout_ok
     if breakout_ok:
         score += 3

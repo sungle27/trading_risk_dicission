@@ -139,7 +139,7 @@ class SymbolState:
 
         # decision TFs
         self.r5m = TimeframeResampler(5 * 60)    # EARLY (unused in SIM)
-        self.r15m = TimeframeResampler(1 * 60)   # MAIN (for fast test)
+        self.r15m = TimeframeResampler(15 * 60)   # MAIN (for fast test)
 
         # history
         self.candles_15m: List[dict] = []
