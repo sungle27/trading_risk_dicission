@@ -388,6 +388,7 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
 
                                             # ---- SIM open ----
                                             if SIM_ENABLED:
+                                                print(f"DEBUG: OPEN TRIGGERED {sym}")
                                                 sim.open(
                                                     SimPosition(
                                                         symbol=sym,
@@ -400,7 +401,9 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                         opened_at=time.time(),
                                                     )
                                                 )
-
+                                                print(f"OPENED {sym} at {rp.entry}")
+                                                await send_telegram("DEBUG: OPEN CALLED")
+                                                
                                                 pos_mgr.open(
                                                     symbol=sym,
                                                     direction=sig["direction"],
