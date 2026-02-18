@@ -37,9 +37,6 @@ SIM_ENABLED = bool(int(getattr(CFG, "SIM_ENABLED", 1)))
 SIM_START_NAV = float(getattr(CFG, "SIM_START_NAV", 10000.0))
 SIM_RR = float(getattr(CFG, "SIM_RR", 2.0))
 
-# If True: bot will only open trades in MAIN timeframe (15m)
-SIM_TRADE_ON_MAIN_ONLY = True
-
 
 # ============================================================
 # SIM EXECUTION (Paper trading)
@@ -54,6 +51,7 @@ class SimPosition:
     tp: float
     risk_usd: float
     opened_at: float
+
 
 class ExecutionSimulator:
     def __init__(self, nav_usd: float, rr: float = 2.0):
@@ -140,18 +138,14 @@ class SymbolState:
         self.vol_bucket = 0.0
 
         # decision TFs
-        self.r5m = TimeframeResampler(5 * 60)     # EARLY
-        self.r15m = TimeframeResampler(1 * 60)   # MAIN
+        self.r5m = TimeframeResampler(5 * 60)    # EARLY (unused in SIM)
+        self.r15m = TimeframeResampler(1 * 60)   # MAIN (for fast test)
 
         # history
-        self.candles_5m: List[dict] = []
-        self.volumes_5m: List[float] = []
-
         self.candles_15m: List[dict] = []
         self.volumes_15m: List[float] = []
 
         # cooldown
-        self.last_early = 0
         self.last_main = 0
 
     def mid(self):
@@ -191,7 +185,8 @@ async def ws_bookticker(states: Dict[str, SymbolState], url: str):
                         if sym in states:
                             states[sym].bid = float(data["b"])
                             states[sym].ask = float(data["a"])
-        except Exception:
+        except Exception as e:
+            print("bookticker error:", e)
             await asyncio.sleep(5)
 
 
@@ -199,7 +194,6 @@ async def ws_bookticker(states: Dict[str, SymbolState], url: str):
 # REGIME NOTIFY (optional)
 # ============================================================
 async def notify_regime_change(new_regime: str, reason: str):
-    # Bạn có thể tắt hẳn notify regime bằng cách return ngay
     if not bool(int(getattr(CFG, "REGIME_NOTIFY", 1))):
         return
 
@@ -228,19 +222,21 @@ def compute_atr(candles: List[dict], period: int) -> Optional[float]:
 # NAV MONITOR (hourly)
 # ============================================================
 async def nav_monitor():
+    interval_sec = int(getattr(CFG, "NAV_REPORT_SEC", 60 * 60))  # default 1h
     while True:
-        await asyncio.sleep(60 * 60)  # 1 hour
+        await asyncio.sleep(interval_sec)
 
         total_risk = pos_mgr.total_risk_usd() if hasattr(pos_mgr, "total_risk_usd") else 0.0
         open_positions = len(sim.positions) if SIM_ENABLED else 0
 
         await send_telegram(
-            f"📊 SIM STATUS (Hourly)\n"
+            f"📊 SIM STATUS\n"
             f"NAV: {sim.nav:.2f} USDT\n"
             f"Open positions: {open_positions}\n"
             f"Total risk: {total_risk:.2f} USDT\n"
             f"Regime: {MARKET_REGIME}"
         )
+
 
 # ============================================================
 # WS: AGG TRADE (engine)
@@ -248,15 +244,12 @@ async def nav_monitor():
 async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
     await send_telegram(
         "✅ SIM TRADING BOT RUNNING\n"
-        f"symbols={len(states)} | MAIN=15m\n"
+        f"symbols={len(states)} | MAIN=1m(test)\n"
         f"SIM={'ON' if SIM_ENABLED else 'OFF'} | NAV={sim.nav:.2f} | RR={SIM_RR}"
     )
 
-    # Ensure proxies exist
     if "BTCUSDT" not in states or "ETHUSDT" not in states:
-        raise RuntimeError(
-            "Regime proxies must be included in FALLBACK_SYMBOLS (BTCUSDT/ETHUSDT)"
-        )
+        raise RuntimeError("Regime proxies must be included in FALLBACK_SYMBOLS (BTCUSDT/ETHUSDT)")
 
     proxy_states = {s: ProxyState() for s in ("BTCUSDT", "ETHUSDT")}
     global MARKET_REGIME, MARKET_PANIC, LAST_REGIME
@@ -288,16 +281,12 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
 
                                     c1, d1 = ps.r1h.update(st.cur_sec, mid, 0.0)
                                     if d1 and c1:
-                                        ps.candles_1h.append({
-                                            "open": c1.open, "high": c1.high, "low": c1.low, "close": c1.close
-                                        })
+                                        ps.candles_1h.append({"open": c1.open, "high": c1.high, "low": c1.low, "close": c1.close})
                                         ps.candles_1h = ps.candles_1h[-300:]
 
                                     c4, d4 = ps.r4h.update(st.cur_sec, mid, 0.0)
                                     if d4 and c4:
-                                        ps.candles_4h.append({
-                                            "open": c4.open, "high": c4.high, "low": c4.low, "close": c4.close
-                                        })
+                                        ps.candles_4h.append({"open": c4.open, "high": c4.high, "low": c4.low, "close": c4.close})
                                         ps.candles_4h = ps.candles_4h[-300:]
 
                                     if d1 and c1:
@@ -312,44 +301,48 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             await notify_regime_change(rr.regime, rr.reason)
                                             LAST_REGIME = rr.regime
 
-                                # ================= MAIN (15m) =================
-                                closed15, did15 = st.r15m.update(st.cur_sec, mid, st.vol_bucket)
-                                if did15 and closed15:
-                                    candle15 = {
-                                        "open": closed15.open,
-                                        "high": closed15.high,
-                                        "low": closed15.low,
-                                        "close": closed15.close,
+                                # ================= MAIN (1m test) =================
+                                closed, did = st.r15m.update(st.cur_sec, mid, st.vol_bucket)
+                                if did and closed:
+                                    candle = {
+                                        "open": closed.open,
+                                        "high": closed.high,
+                                        "low": closed.low,
+                                        "close": closed.close,
                                     }
-                                    st.candles_15m.append(candle15)
-                                    st.volumes_15m.append(closed15.volume)
+                                    st.candles_15m.append(candle)
+                                    st.volumes_15m.append(closed.volume)
                                     st.candles_15m = st.candles_15m[-300:]
                                     st.volumes_15m = st.volumes_15m[-300:]
 
                                     # ---- SIM: update existing position first ----
                                     if SIM_ENABLED:
-                                        close_info = sim.update_by_candle(sym, candle15)
-                                        if close_info:
-                                            pos_mgr.close(sym)
-                                            pos_mgr.update_nav(sim.nav)
+                                        try:
+                                            close_info = sim.update_by_candle(sym, candle)
+                                            if close_info:
+                                                pos_mgr.close_position(sym)
+                                                pos_mgr.update_nav(sim.nav)
 
-                                            exit_price = close_info.get("exit")
-                                            pnl = close_info.get("pnl")
+                                                exit_price = close_info.get("exit")
+                                                pnl = close_info.get("pnl")
 
-                                            exit_str = f"{exit_price:.6f}" if isinstance(exit_price, (int, float)) else "None"
-                                            pnl_str = f"{pnl:.2f}" if isinstance(pnl, (int, float)) else "0.00"
+                                                exit_str = f"{exit_price:.6f}" if isinstance(exit_price, (int, float)) else "None"
+                                                pnl_str = f"{pnl:.2f}" if isinstance(pnl, (int, float)) else "0.00"
 
-                                            await send_telegram(
-                                                f"🔴 CLOSE {sym}\n"
-                                                f"Exit: {exit_str}\n"
-                                                f"Result: {close_info.get('result')}\n"
-                                                f"PnL: {pnl_str} USDT\n"
-                                                f"NAV: {sim.nav:.2f} USDT"
-                                            )
+                                                await send_telegram(
+                                                    f"🔴 CLOSE {sym}\n"
+                                                    f"Exit: {exit_str}\n"
+                                                    f"Result: {close_info.get('result')}\n"
+                                                    f"PnL: {pnl_str} USDT\n"
+                                                    f"NAV: {sim.nav:.2f} USDT"
+                                                )
+                                        except Exception as e:
+                                            print("[CLOSE ERROR]", sym, e)
+                                            await send_telegram(f"⚠️ CLOSE ERROR {sym}: {e}")
 
-                                    # ---- Decide open new trade only on 15m close ----
+                                    # ---- Decide open new trade only on candle close ----
                                     now = int(time.time())
-                                    if now - st.last_main >= CFG.COOLDOWN_SEC_MAIN:
+                                    if now - st.last_main >= int(getattr(CFG, "COOLDOWN_SEC_MAIN", 60)):
                                         sig = check_signal(
                                             sym,
                                             st.candles_15m,
@@ -359,24 +352,30 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             market_regime=MARKET_REGIME,
                                             market_panic=MARKET_PANIC,
                                         )
+
                                         if sig:
                                             st.last_main = now
 
-                                            # Policy: During panic, block LONG
                                             if MARKET_PANIC and sig["direction"] == "LONG":
+                                                st.vol_bucket = 0.0
+                                                st.cur_sec += 1
                                                 continue
 
                                             if SIM_ENABLED and sim.has_pos(sym):
-                                                continue  # already in position
+                                                st.vol_bucket = 0.0
+                                                st.cur_sec += 1
+                                                continue
 
-                                            atr_val = compute_atr(st.candles_15m, CFG.ATR_SHORT)
+                                            atr_val = compute_atr(st.candles_15m, int(getattr(CFG, "ATR_SHORT", 14)))
                                             if atr_val is None:
+                                                st.vol_bucket = 0.0
+                                                st.cur_sec += 1
                                                 continue
 
                                             rp = build_risk_plan(
                                                 symbol=sym,
                                                 direction=sig["direction"],
-                                                entry=float(closed15.close),
+                                                entry=float(closed.close),
                                                 atr_value=float(atr_val),
                                                 nav_usd=float(sim.nav),
                                                 mode="main",
@@ -389,50 +388,49 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 new_prices=[c["close"] for c in st.candles_15m[-60:]],
                                             )
                                             if not ok:
+                                                st.vol_bucket = 0.0
+                                                st.cur_sec += 1
                                                 continue
 
                                             # ---- SIM open ----
                                             if SIM_ENABLED:
-                                                print(f"DEBUG: OPEN TRIGGERED {sym}")
-                                                sim.open(
-                                                    SimPosition(
+                                                try:
+                                                    sim.open(
+                                                        SimPosition(
+                                                            symbol=sym,
+                                                            direction=sig["direction"],
+                                                            qty=float(rp.qty),
+                                                            entry=float(rp.entry),
+                                                            sl=float(rp.sl),
+                                                            tp=float(rp.tp),
+                                                            risk_usd=float(rp.risk_usd),
+                                                            opened_at=time.time(),
+                                                        )
+                                                    )
+
+                                                    pos_mgr.open_position(
                                                         symbol=sym,
                                                         direction=sig["direction"],
                                                         qty=float(rp.qty),
                                                         entry=float(rp.entry),
                                                         sl=float(rp.sl),
-                                                        tp=float(rp.tp),
+                                                        tp=float(rp.tp) if rp.tp is not None else None,
                                                         risk_usd=float(rp.risk_usd),
-                                                        opened_at=time.time(),
+                                                        price_history=[c["close"] for c in st.candles_15m[-60:]],
                                                     )
-                                                )
-                                                print(f"OPENED {sym} at {rp.entry}")
-                                                await send_telegram("DEBUG: OPEN CALLED")
+                                                    pos_mgr.update_nav(sim.nav)
 
-                                                pos_mgr.open(
-                                                    symbol=sym,
-                                                    direction=sig["direction"],
-                                                    qty=float(rp.qty),
-                                                    entry=float(rp.entry),
-                                                    sl=float(rp.sl),
-                                                    tp=float(rp.tp),
-                                                    risk_usd=float(rp.risk_usd),
-                                                    price_history=[c["close"] for c in st.candles_15m[-60:]],
-                                                )
-                                                pos_mgr.update_nav(sim.nav)
-                                                await send_telegram("DEBUG: OPEN CALLED 2222")
-                                                tp_str = f"{rp.tp:.6f}" if rp.tp is not None else "None"
-                                                await send_telegram("DEBUG: OPEN CALLED 333")
-
-                                                await send_telegram(
-                                                    f"🟢 OPEN {sig['direction']} {sym}\n"
-                                                    f"Entry: {rp.entry:.6f}\n"
-                                                    f"Qty: {rp.qty:.4f}\n"
-                                                    f"SL: {rp.sl:.6f}\n"
-                                                    f"TP: {tp_str}\n"
-                                                    f"NAV: {sim.nav:.2f} USDT"
-                                                )
-                                                await send_telegram("DEBUG: OPEN CALLED 444")
+                                                    await send_telegram(
+                                                        f"🟢 OPEN {sig['direction']} {sym}\n"
+                                                        f"Entry: {rp.entry:.6f}\n"
+                                                        f"Qty: {rp.qty:.4f}\n"
+                                                        f"SL: {rp.sl:.6f}\n"
+                                                        f"TP: {rp.tp:.6f}\n"
+                                                        f"NAV: {sim.nav:.2f} USDT"
+                                                    )
+                                                except Exception as e:
+                                                    print("[OPEN ERROR]", sym, e)
+                                                    await send_telegram(f"⚠️ OPEN ERROR {sym}: {e}")
 
                                 st.vol_bucket = 0.0
 
@@ -458,7 +456,7 @@ async def main():
     await asyncio.gather(
         ws_bookticker(states, url_book),
         ws_aggtrade(states, url_trade),
-        nav_monitor(),  # 👈 thêm dòng này
+        nav_monitor(),
     )
 
 
