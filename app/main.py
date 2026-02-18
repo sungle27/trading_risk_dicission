@@ -333,11 +333,17 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             pos_mgr.close(sym)
                                             pos_mgr.update_nav(sim.nav)
 
+                                            exit_price = close_info.get("exit")
+                                            pnl = close_info.get("pnl")
+
+                                            exit_str = f"{exit_price:.6f}" if isinstance(exit_price, (int, float)) else "None"
+                                            pnl_str = f"{pnl:.2f}" if isinstance(pnl, (int, float)) else "0.00"
+
                                             await send_telegram(
                                                 f"🔴 CLOSE {sym}\n"
-                                                f"Exit: {close_info['exit']:.6f}\n"
-                                                f"Result: {close_info['result']}\n"
-                                                f"PnL: {close_info['pnl']:.2f} USDT\n"
+                                                f"Exit: {exit_str}\n"
+                                                f"Result: {close_info.get('result')}\n"
+                                                f"PnL: {pnl_str} USDT\n"
                                                 f"NAV: {sim.nav:.2f} USDT"
                                             )
 
@@ -415,14 +421,16 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 )
                                                 pos_mgr.update_nav(sim.nav)
 
-                                                await send_telegram(
-                                                    f"🟢 OPEN {sig['direction']} {sym}\n"
-                                                    f"Entry: {rp.entry:.6f}\n"
-                                                    f"Qty: {rp.qty:.4f}\n"
-                                                    f"SL: {rp.sl:.6f}\n"
-                                                    f"TP: {rp.tp:.6f}\n"
-                                                    f"NAV: {sim.nav:.2f} USDT"
-                                                )
+                                            tp_str = f"{rp.tp:.6f}" if rp.tp is not None else "None"
+
+                                            await send_telegram(
+                                                f"🟢 OPEN {sig['direction']} {sym}\n"
+                                                f"Entry: {rp.entry:.6f}\n"
+                                                f"Qty: {rp.qty:.4f}\n"
+                                                f"SL: {rp.sl:.6f}\n"
+                                                f"TP: {tp_str}\n"
+                                                f"NAV: {sim.nav:.2f} USDT"
+                                            )
 
                                 st.vol_bucket = 0.0
 
