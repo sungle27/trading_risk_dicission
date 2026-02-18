@@ -55,7 +55,6 @@ class SimPosition:
     risk_usd: float
     opened_at: float
 
-
 class ExecutionSimulator:
     def __init__(self, nav_usd: float, rr: float = 2.0):
         self.nav = float(nav_usd)
@@ -403,7 +402,7 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 )
                                                 print(f"OPENED {sym} at {rp.entry}")
                                                 await send_telegram("DEBUG: OPEN CALLED")
-                                                
+
                                                 pos_mgr.open(
                                                     symbol=sym,
                                                     direction=sig["direction"],
