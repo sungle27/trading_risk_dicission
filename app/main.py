@@ -56,7 +56,7 @@ class SimPosition:
 class ExecutionSimulator:
     def __init__(self, nav_usd: float, rr: float = 2.0):
         self.nav = float(nav_usd)
-        self.rr = float(rr)
+        self.base_rr = float(rr)
         self.positions: Dict[str, SimPosition] = {}
 
     def has_pos(self, symbol: str) -> bool:
@@ -217,6 +217,33 @@ def compute_atr(candles: List[dict], period: int) -> Optional[float]:
         atr_val = atr.update(float(c["high"]), float(c["low"]), float(c["close"]))
     return atr_val
 
+# ============================================================
+# Adaptive Entry (NEW)
+# ============================================================
+def compute_adaptive_entry(close_price: float, direction: str) -> float:
+    pullback = float(getattr(CFG, "ENTRY_PULLBACK_PCT", 0.003))
+    breakout = float(getattr(CFG, "ENTRY_BREAKOUT_PCT", 0.0015))
+
+    # TREND → breakout entry
+    if MARKET_REGIME == "TREND":
+        if direction == "LONG":
+            return close_price * (1 + breakout)
+        else:
+            return close_price * (1 - breakout)
+
+    # RANGE/NORMAL → pullback entry
+    elif MARKET_REGIME in ("NORMAL", "RANGE"):
+        if direction == "LONG":
+            return close_price * (1 - pullback)
+        else:
+            return close_price * (1 + pullback)
+
+    # PANIC → breakout only
+    else:
+        if direction == "LONG":
+            return close_price * (1 + breakout)
+        else:
+            return close_price * (1 - breakout)
 
 # ============================================================
 # NAV MONITOR (hourly)
@@ -372,14 +399,52 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 st.cur_sec += 1
                                                 continue
 
+                                            base_nav = sim.nav
+
+                                            risk_multiplier = 1.0
+
+                                            # High confidence → tăng risk
+                                            if sig.get("high_conf"):
+                                                risk_multiplier *= 1.3
+
+                                            # Regime trend → tăng nhẹ
+                                            if MARKET_REGIME == "TREND":
+                                                risk_multiplier *= 1.2
+
+                                            # Regime range → giảm risk
+                                            if MARKET_REGIME == "RANGE":
+                                                risk_multiplier *= 0.6
+
+                                            # Regime panic → giảm mạnh
+                                            if MARKET_PANIC:
+                                                risk_multiplier *= 0.5
+
+                                            # ======================
+                                            # Adaptive RR
+                                            # ======================
+                                            rr = SIM_RR  # default
+
+                                            if sig.get("high_conf"):
+                                                rr = 2.5
+                                            elif MARKET_REGIME == "TREND":
+                                                rr = 2.2
+                                            else:
+                                                rr = 1.8
+
+                                            entry_price = compute_adaptive_entry(
+                                                float(closed.close),
+                                                sig["direction"],
+                                            )
+
                                             rp = build_risk_plan(
                                                 symbol=sym,
                                                 direction=sig["direction"],
-                                                entry=float(closed.close),
+                                                entry=entry_price,
                                                 atr_value=float(atr_val),
                                                 nav_usd=float(sim.nav),
                                                 mode="main",
                                                 cfg=CFG,
+                                                rr=rr,
                                             )
 
                                             ok, reason = pos_mgr.can_open(
