@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+
 @dataclass
 class Position:
     symbol: str
@@ -16,22 +17,16 @@ class Position:
     risk_usd: float
     price_history: List[float] = field(default_factory=list)
 
-class PositionManager:
-    """
-    Portfolio gatekeeper:
-    - max_positions
-    - max_total_risk (pct NAV or usd)
-    - optional correlation filter
-    """
 
+class PositionManager:
     def __init__(
         self,
         *,
         nav_usd: float = 0.0,
         max_positions: int = 10,
-        max_total_risk_pct: Optional[float] = None,   # % NAV
-        max_total_risk_usd: Optional[float] = None,   # absolute USD
-        max_correlation: Optional[float] = None,      # e.g. 0.85
+        max_total_risk_pct: Optional[float] = None,
+        max_total_risk_usd: Optional[float] = None,
+        max_correlation: Optional[float] = None,
         cfg=None,
     ):
         self.nav_usd = float(nav_usd)
@@ -40,8 +35,8 @@ class PositionManager:
 
         if max_total_risk_pct is None and cfg is not None:
             max_total_risk_pct = getattr(cfg, "MAX_TOTAL_RISK_PCT", None)
-        self.max_total_risk_pct = float(max_total_risk_pct) if max_total_risk_pct is not None else None
 
+        self.max_total_risk_pct = float(max_total_risk_pct) if max_total_risk_pct is not None else None
         self.max_total_risk_usd = float(max_total_risk_usd) if max_total_risk_usd is not None else None
 
         if max_correlation is None and cfg is not None:
@@ -49,7 +44,7 @@ class PositionManager:
         self.max_correlation = float(max_correlation) if max_correlation is not None else None
 
     # -----------------------------
-    # NAV / Limits
+    # NAV & Risk
     # -----------------------------
     def update_nav(self, nav_usd: float) -> None:
         self.nav_usd = float(nav_usd)
@@ -68,19 +63,18 @@ class PositionManager:
         return symbol in self.positions
 
     # -----------------------------
-    # Correlation Filter
+    # Correlation
     # -----------------------------
     def _corr_ok(self, new_prices: Optional[List[float]]) -> Tuple[bool, str]:
         if self.max_correlation is None:
             return True, "ok"
-
         if not new_prices or len(new_prices) < 20:
-            return True, "ok"  # not enough info -> don't block
+            return True, "ok"
 
         try:
             from app.correlation_engine import correlation
         except Exception:
-            return True, "ok"  # correlation engine not available -> don't block
+            return True, "ok"
 
         for p in self.positions.values():
             if not p.price_history or len(p.price_history) < 20:
@@ -111,8 +105,9 @@ class PositionManager:
             return False, "max_positions_reached"
 
         limit_usd = self.risk_limit_usd()
-        if limit_usd is not None and (self.total_risk_usd() + float(risk_usd) > limit_usd):
-            return False, "max_total_risk_reached"
+        if limit_usd is not None:
+            if self.total_risk_usd() + float(risk_usd) > limit_usd:
+                return False, "max_total_risk_reached"
 
         ok_corr, reason = self._corr_ok(new_prices)
         if not ok_corr:
@@ -150,13 +145,6 @@ class PositionManager:
     def close_position(self, symbol: str) -> None:
         if symbol in self.positions:
             del self.positions[symbol]
-
-    # Backward-compatible aliases
-    def open(self, *args, **kwargs):  # pragma: no cover
-        return self.open_position(*args, **kwargs)
-
-    def close(self, symbol: str):  # pragma: no cover
-        return self.close_position(symbol)
 
     def snapshot(self) -> Dict[str, dict]:
         return {
