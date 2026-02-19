@@ -21,6 +21,8 @@ from app.position_manager import PositionManager
 from app.drawdown_manager import DrawdownManager
 from app.indicators import ATR
 
+from app.decision_engine import decide_trade
+
 
 # ============================================================
 # Market Regime (global)
@@ -71,34 +73,20 @@ class ExecutionSimulator:
         return symbol in self.positions
 
     def _apply_slippage_open(self, direction: str, entry: float) -> float:
-        """
-        Slippage against you:
-        - LONG: filled a bit higher
-        - SHORT: filled a bit lower
-        """
         s = self.slippage_pct
         if s <= 0:
             return entry
-        if direction == "LONG":
+        if direction.upper() == "LONG":
             return entry * (1 + s)
         return entry * (1 - s)
 
-    def _apply_slippage_exit(self, direction: str, exit_price: float, result: str) -> float:
-        """
-        Exit slippage (simple):
-        - SL: worse fill
-        - TP: slightly worse too (still realistic)
-        """
+    def _apply_slippage_exit(self, direction: str, exit_price: float) -> float:
         s = self.slippage_pct
         if s <= 0:
             return exit_price
-
-        if direction == "LONG":
-            # SL exits lower, TP exits lower
+        if direction.upper() == "LONG":
             return exit_price * (1 - s)
-        else:
-            # SHORT SL exits higher, TP exits higher
-            return exit_price * (1 + s)
+        return exit_price * (1 + s)
 
     def open(self, pos: SimPosition) -> None:
         self.positions[pos.symbol] = pos
@@ -107,10 +95,6 @@ class ExecutionSimulator:
         return self.positions.pop(symbol, None)
 
     def update_by_candle(self, symbol: str, candle: dict) -> Optional[dict]:
-        """
-        Check SL/TP using candle high/low.
-        Return dict: {result, exit, pnl, rr}
-        """
         pos = self.positions.get(symbol)
         if not pos:
             return None
@@ -122,38 +106,23 @@ class ExecutionSimulator:
         exit_price: Optional[float] = None
         pnl = 0.0
 
-        # LONG
         if pos.direction == "LONG":
             if low <= pos.sl:
-                result = "SL"
-                exit_price = pos.sl
-                pnl = -pos.risk_usd
+                result, exit_price, pnl = "SL", pos.sl, -pos.risk_usd
             elif high >= pos.tp:
-                result = "TP"
-                exit_price = pos.tp
-                pnl = pos.risk_usd * pos.rr
-
-        # SHORT
+                result, exit_price, pnl = "TP", pos.tp, pos.risk_usd * pos.rr
         else:
             if high >= pos.sl:
-                result = "SL"
-                exit_price = pos.sl
-                pnl = -pos.risk_usd
+                result, exit_price, pnl = "SL", pos.sl, -pos.risk_usd
             elif low <= pos.tp:
-                result = "TP"
-                exit_price = pos.tp
-                pnl = pos.risk_usd * pos.rr
+                result, exit_price, pnl = "TP", pos.tp, pos.risk_usd * pos.rr
 
         if not result:
             return None
 
-        # apply exit slippage
-        exit_filled = self._apply_slippage_exit(pos.direction, float(exit_price), result)
-
-        # NAV update
+        exit_filled = self._apply_slippage_exit(pos.direction, float(exit_price))
         self.nav += pnl
 
-        # stats
         self.total_trades += 1
         self.total_pnl += pnl
         if pnl > 0:
@@ -163,15 +132,10 @@ class ExecutionSimulator:
 
         self.close(symbol)
 
-        return {
-            "result": result,
-            "exit": exit_filled,
-            "pnl": pnl,
-            "rr": pos.rr,
-        }
+        return {"result": result, "exit": exit_filled, "pnl": pnl, "rr": pos.rr}
 
     def summary(self) -> dict:
-        winrate = (self.win_trades / self.total_trades * 100.0) if self.total_trades > 0 else 0.0
+        winrate = (self.win_trades / self.total_trades * 100.0) if self.total_trades else 0.0
         return {
             "total": self.total_trades,
             "wins": self.win_trades,
@@ -183,7 +147,7 @@ class ExecutionSimulator:
 
 
 # ============================================================
-# GLOBAL: Position Manager
+# GLOBAL: Position Manager + Drawdown
 # ============================================================
 pos_mgr = PositionManager(
     nav_usd=float(getattr(CFG, "NAV_USD", SIM_START_NAV)),
@@ -193,7 +157,10 @@ pos_mgr = PositionManager(
     cfg=CFG,
 )
 
-sim = ExecutionSimulator(nav_usd=SIM_START_NAV, slippage_pct=float(getattr(CFG, "SLIPPAGE_PCT", 0.0)))
+sim = ExecutionSimulator(
+    nav_usd=SIM_START_NAV,
+    slippage_pct=float(getattr(CFG, "SLIPPAGE_PCT", 0.0)),
+)
 pos_mgr.update_nav(sim.nav)
 
 ddm = DrawdownManager(
@@ -215,15 +182,11 @@ class SymbolState:
         self.bid = None
         self.ask = None
         self.cur_sec = None
-
         self.vol_bucket = 0.0
 
-        # MAIN timeframe
         self.r_main = TimeframeResampler(15 * 60)
-
         self.candles: List[dict] = []
         self.volumes: List[float] = []
-
         self.last_main = 0
 
     def mid(self) -> Optional[float]:
@@ -238,9 +201,6 @@ class SymbolState:
         return (float(self.ask) - float(self.bid)) / float(m)
 
 
-# ============================================================
-# Proxy (BTC / ETH) for regime
-# ============================================================
 class ProxyState:
     def __init__(self):
         self.r1h = TimeframeResampler(60 * 60)
@@ -263,57 +223,12 @@ def compute_atr(candles: List[dict], period: int) -> Optional[float]:
 
 
 def liquidity_usd_last_n(candles: List[dict], volumes: List[float], n: int = 20) -> float:
-    """
-    Very simple liquidity proxy: sum(volume) * close.
-    (Works acceptably for filtering low-liquidity alts.)
-    """
     if not candles or not volumes:
         return 0.0
     n = min(n, len(candles), len(volumes))
     close = float(candles[-1]["close"])
     v_sum = float(sum(volumes[-n:]))
     return v_sum * close
-
-
-def choose_rr_and_sl(sig: dict) -> Tuple[float, float]:
-    """
-    Dynamic RR & SL multiplier (ATR multiple) using existing signal fields.
-    """
-    base_rr = float(getattr(CFG, "SIM_RR", 2.0))
-    sl_mult = float(getattr(CFG, "SL_ATR_MULT", 1.5))
-
-    # High confidence -> go for bigger RR
-    if sig.get("high_conf"):
-        base_rr = 2.5
-        sl_mult *= 1.05
-
-    # Regime adjust
-    if MARKET_REGIME == "TREND":
-        base_rr = max(base_rr, 2.2)
-        sl_mult *= 1.10
-    elif MARKET_REGIME == "RANGE":
-        base_rr = min(base_rr, 1.6)
-        sl_mult *= 0.90
-
-    # Micro-adjust by volume & momentum if present
-    vr = float(sig.get("volume_ratio", 1.0))
-    mom = float(sig.get("momentum", 0.0)) if "momentum" in sig else 0.0
-
-    if vr >= 3.0:
-        base_rr += 0.2
-    if mom >= 0.010:
-        base_rr += 0.2
-
-    # ATR squeeze -> breakout style: tighter SL, higher RR
-    if sig.get("atr_squeeze"):
-        sl_mult *= 0.90
-        base_rr += 0.2
-
-    # clamp
-    base_rr = max(1.2, min(3.0, base_rr))
-    sl_mult = max(0.8, min(2.8, sl_mult))
-
-    return base_rr, sl_mult
 
 
 def compute_entry(close_price: float, direction: str) -> float:
@@ -324,15 +239,12 @@ def compute_entry(close_price: float, direction: str) -> float:
     if mode != "adaptive":
         return close_price
 
-    # TREND: breakout entry
-    if MARKET_REGIME == "TREND":
+    if MARKET_REGIME.upper() == "TREND":
         return close_price * (1 + breakout) if direction == "LONG" else close_price * (1 - breakout)
 
-    # RANGE/NORMAL: pullback entry
-    if MARKET_REGIME in ("NORMAL", "RANGE"):
+    if MARKET_REGIME.upper() in ("NORMAL", "RANGE"):
         return close_price * (1 - pullback) if direction == "LONG" else close_price * (1 + pullback)
 
-    # PANIC: breakout (but you already block LONG in panic below)
     return close_price * (1 + breakout) if direction == "LONG" else close_price * (1 - breakout)
 
 
@@ -415,15 +327,13 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                             mid = st.mid()
                             if mid:
 
-                                # ---------------- REGIME UPDATE (BTC/ETH) ----------------
+                                # ---- REGIME UPDATE (BTC/ETH)
                                 if sym in proxy_states:
                                     ps = proxy_states[sym]
-
                                     c1, d1 = ps.r1h.update(st.cur_sec, mid, 0.0)
                                     if d1 and c1:
                                         ps.candles_1h.append({"open": c1.open, "high": c1.high, "low": c1.low, "close": c1.close})
                                         ps.candles_1h = ps.candles_1h[-300:]
-
                                     c4, d4 = ps.r4h.update(st.cur_sec, mid, 0.0)
                                     if d4 and c4:
                                         ps.candles_4h.append({"open": c4.open, "high": c4.high, "low": c4.low, "close": c4.close})
@@ -436,19 +346,13 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                         )
                                         MARKET_REGIME = rr_state.regime
                                         MARKET_PANIC = rr_state.panic
-
                                         if rr_state.regime != LAST_REGIME:
                                             LAST_REGIME = rr_state.regime
 
-                                # ---------------- MAIN candle close ----------------
+                                # ---- MAIN candle close
                                 closed, did = st.r_main.update(st.cur_sec, mid, st.vol_bucket)
                                 if did and closed:
-                                    candle = {
-                                        "open": closed.open,
-                                        "high": closed.high,
-                                        "low": closed.low,
-                                        "close": closed.close,
-                                    }
+                                    candle = {"open": closed.open, "high": closed.high, "low": closed.low, "close": closed.close}
                                     st.candles.append(candle)
                                     st.volumes.append(closed.volume)
                                     st.candles = st.candles[-400:]
@@ -478,9 +382,8 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                     if now - st.last_main >= int(getattr(CFG, "COOLDOWN_SEC_MAIN", 900)):
                                         st.last_main = now
 
-                                        # drawdown gate
                                         ddm.update(sim.nav)
-                                        can, dd_reason = ddm.can_trade()
+                                        can, _ = ddm.can_trade()
                                         if not can:
                                             continue
 
@@ -495,11 +398,6 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                         )
                                         if not sig:
                                             continue
-
-                                        # panic policy: block LONG
-                                        if MARKET_PANIC and sig.get("direction") == "LONG":
-                                            continue
-
                                         if sim.has_pos(sym):
                                             continue
 
@@ -513,39 +411,42 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                         if atr_val is None:
                                             continue
 
-                                        # dynamic RR & SL
-                                        rr, sl_mult = choose_rr_and_sl(sig)
+                                        direction = str(sig["direction"]).upper()
+                                        entry = compute_entry(float(closed.close), direction)
 
-                                        entry = compute_entry(float(closed.close), sig["direction"])
+                                        # decision_engine (moved out of main)
+                                        base_slm = float(getattr(CFG, "SL_ATR_MULT", 1.5))
+                                        dec = decide_trade(
+                                            market_regime=MARKET_REGIME,
+                                            market_panic=MARKET_PANIC,
+                                            mode="main",
+                                            direction=direction,
+                                            score=int(sig.get("score", 0)),
+                                            high_conf=bool(sig.get("high_conf", False)),
+                                            base_rr=float(getattr(CFG, "SIM_RR", 2.0)),
+                                            base_sl_atr_mult=base_slm,
+                                        )
+                                        if not dec.allow:
+                                            continue
 
-                                        # risk multiplier from drawdown + regime
-                                        risk_mult = ddm.risk_multiplier()
-
-                                        if sig.get("high_conf"):
-                                            risk_mult *= 1.20
-                                        if MARKET_REGIME == "TREND":
-                                            risk_mult *= 1.10
-                                        if MARKET_REGIME == "RANGE":
-                                            risk_mult *= 0.75
-                                        if MARKET_PANIC:
-                                            risk_mult *= 0.60
+                                        # risk multiplier from drawdown + decision
+                                        risk_mult = ddm.risk_multiplier() * dec.risk_mult
 
                                         rp: RiskPlan = build_risk_plan(
                                             symbol=sym,
-                                            direction=sig["direction"],
+                                            direction=direction,
                                             entry=entry,
                                             atr_value=float(atr_val),
                                             nav_usd=float(sim.nav),
                                             mode="main",
                                             cfg=CFG,
-                                            rr=rr,
-                                            risk_multiplier=risk_mult,
-                                            sl_atr_mult=sl_mult,
+                                            rr=float(dec.rr),
+                                            risk_multiplier=float(risk_mult),
+                                            sl_atr_mult=float(dec.sl_atr_mult),
                                             target_vol_pct=float(getattr(CFG, "TARGET_VOL_PCT", 0.015)),
                                         )
 
-                                        # PM gate
-                                        ok, reason = pos_mgr.can_open(
+                                        ok, _ = pos_mgr.can_open(
                                             symbol=sym,
                                             risk_usd=float(rp.risk_usd),
                                             new_prices=[c["close"] for c in st.candles[-80:]],
@@ -553,10 +454,7 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                         if not ok:
                                             continue
 
-                                        # apply slippage to filled entry
                                         filled_entry = sim._apply_slippage_open(rp.direction, rp.entry)
-
-                                        # keep SL/TP distances same (shifted)
                                         dist_sl = abs(rp.entry - rp.sl)
                                         dist_tp = abs(rp.tp - rp.entry)
 
@@ -567,7 +465,6 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             sl = filled_entry + dist_sl
                                             tp = filled_entry - dist_tp
 
-                                        # open sim
                                         sim.open(
                                             SimPosition(
                                                 symbol=sym,
@@ -582,7 +479,6 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             )
                                         )
 
-                                        # open PM
                                         pos_mgr.open_position(
                                             symbol=sym,
                                             direction=rp.direction,
@@ -606,7 +502,7 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             f"TP: {tp:.6f}\n"
                                             f"Risk: {rp.risk_usd:.2f} USDT | RR: {rp.rr:.2f}\n"
                                             f"NAV: {sim.nav:.2f} | DD: {dd.dd_pct*100:.2f}%\n"
-                                            f"liq≈{liq:,.0f}$ | {rp.notes}"
+                                            f"liq≈{liq:,.0f}$ | decision={dec.reason} | {rp.notes}"
                                         )
 
                                     st.vol_bucket = 0.0
@@ -624,7 +520,6 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
 # MAIN
 # ============================================================
 async def main():
-    # enforce timeframe from config if you want
     states = {s: SymbolState() for s in FALLBACK_SYMBOLS}
 
     ws_base = CFG.BINANCE_FUTURES_WS

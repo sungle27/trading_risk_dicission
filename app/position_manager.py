@@ -24,9 +24,9 @@ class PositionManager:
         *,
         nav_usd: float = 0.0,
         max_positions: int = 10,
-        max_total_risk_pct: Optional[float] = None,
-        max_total_risk_usd: Optional[float] = None,
-        max_correlation: Optional[float] = None,
+        max_total_risk_pct: Optional[float] = None,   # % NAV
+        max_total_risk_usd: Optional[float] = None,   # absolute fallback
+        max_correlation: Optional[float] = None,      # e.g. 0.85
         cfg=None,
     ):
         self.nav_usd = float(nav_usd)
@@ -35,7 +35,6 @@ class PositionManager:
 
         if max_total_risk_pct is None and cfg is not None:
             max_total_risk_pct = getattr(cfg, "MAX_TOTAL_RISK_PCT", None)
-
         self.max_total_risk_pct = float(max_total_risk_pct) if max_total_risk_pct is not None else None
         self.max_total_risk_usd = float(max_total_risk_usd) if max_total_risk_usd is not None else None
 
@@ -44,7 +43,7 @@ class PositionManager:
         self.max_correlation = float(max_correlation) if max_correlation is not None else None
 
     # -----------------------------
-    # NAV & Risk
+    # NAV / Limits
     # -----------------------------
     def update_nav(self, nav_usd: float) -> None:
         self.nav_usd = float(nav_usd)
@@ -63,7 +62,7 @@ class PositionManager:
         return symbol in self.positions
 
     # -----------------------------
-    # Correlation
+    # Correlation filter
     # -----------------------------
     def _corr_ok(self, new_prices: Optional[List[float]]) -> Tuple[bool, str]:
         if self.max_correlation is None:
@@ -104,13 +103,12 @@ class PositionManager:
         if len(self.positions) >= self.max_positions:
             return False, "max_positions_reached"
 
-        limit_usd = self.risk_limit_usd()
-        if limit_usd is not None:
-            if self.total_risk_usd() + float(risk_usd) > limit_usd:
-                return False, "max_total_risk_reached"
+        limit = self.risk_limit_usd()
+        if limit is not None and (self.total_risk_usd() + float(risk_usd) > limit):
+            return False, "max_total_risk_reached"
 
-        ok_corr, reason = self._corr_ok(new_prices)
-        if not ok_corr:
+        ok, reason = self._corr_ok(new_prices)
+        if not ok:
             return False, reason
 
         return True, "ok"
