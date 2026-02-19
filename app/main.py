@@ -22,6 +22,29 @@ from app.indicators import ATR
 
 
 # ============================================================
+# Telegram queue (serialize sends to avoid rate-limit / lost awaits)
+# ============================================================
+_TG_Q: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
+
+async def tg_worker():
+    while True:
+        msg = await _TG_Q.get()
+        try:
+            await send_telegram(msg)
+        except Exception as e:
+            print("[TELEGRAM ERROR]", e)
+        finally:
+            _TG_Q.task_done()
+        await asyncio.sleep(0.2)
+
+async def tg_send(msg: str) -> None:
+    try:
+        _TG_Q.put_nowait(msg)
+    except asyncio.QueueFull:
+        print("[TELEGRAM] queue full, dropped message")
+
+
+# ============================================================
 # Market Regime (global)
 # ============================================================
 MRE = MarketRegimeEngine()
@@ -50,33 +73,37 @@ class SimPosition:
     sl: float
     tp: float
     risk_usd: float
+    rr: float
     opened_at: float
 
 
 class ExecutionSimulator:
-    def __init__(self, nav_usd: float, rr: float = 2.0):
+    def __init__(self, nav_usd: float):
         self.nav = float(nav_usd)
-        self.base_rr = float(rr)
         self.positions: Dict[str, SimPosition] = {}
 
-        # ==== STAT TRACKING ====
-        self.total_trades = 0
-        self.win_trades = 0
-        self.loss_trades = 0
-        self.total_pnl = 0.0
+        # performance stats
+        self.trades_total = 0
+        self.wins = 0
+        self.losses = 0
+        self.closed_total = 0
+        self.pnl_total = 0.0
 
     def has_pos(self, symbol: str) -> bool:
         return symbol in self.positions
 
     def open(self, pos: SimPosition) -> None:
         self.positions[pos.symbol] = pos
+        self.trades_total += 1
 
     def close(self, symbol: str) -> Optional[SimPosition]:
-        if symbol in self.positions:
-            return self.positions.pop(symbol)
-        return None
+        return self.positions.pop(symbol, None)
 
     def update_by_candle(self, symbol: str, candle: dict) -> Optional[dict]:
+        """
+        Check SL/TP using candle high/low.
+        Return dict: { "result": "SL"/"TP", "exit": float, "pnl": float, "rr": float } if closed, else None.
+        """
         pos = self.positions.get(symbol)
         if not pos:
             return None
@@ -84,71 +111,48 @@ class ExecutionSimulator:
         high = float(candle["high"])
         low = float(candle["low"])
 
-        result = None
-        exit_price = None
-        pnl = 0.0
-
         # LONG
         if pos.direction == "LONG":
             if low <= pos.sl:
                 pnl = -pos.risk_usd
-                exit_price = pos.sl
-                result = "SL"
-            elif high >= pos.tp:
-                pnl = pos.risk_usd * self.base_rr
-                exit_price = pos.tp
-                result = "TP"
+                self.nav += pnl
+                self.pnl_total += pnl
+                self.close(symbol)
+                self.losses += 1
+                self.closed_total += 1
+                return {"result": "SL", "exit": pos.sl, "pnl": pnl, "rr": pos.rr}
+            if high >= pos.tp:
+                pnl = pos.risk_usd * pos.rr
+                self.nav += pnl
+                self.pnl_total += pnl
+                self.close(symbol)
+                self.wins += 1
+                self.closed_total += 1
+                return {"result": "TP", "exit": pos.tp, "pnl": pnl, "rr": pos.rr}
 
         # SHORT
         else:
             if high >= pos.sl:
                 pnl = -pos.risk_usd
-                exit_price = pos.sl
-                result = "SL"
-            elif low <= pos.tp:
-                pnl = pos.risk_usd * self.base_rr
-                exit_price = pos.tp
-                result = "TP"
-
-        if result:
-            self.nav += pnl
-            self.total_trades += 1
-            self.total_pnl += pnl
-
-            if pnl > 0:
-                self.win_trades += 1
-            else:
-                self.loss_trades += 1
-
-            self.close(symbol)
-
-            return {
-                "result": result,
-                "exit": exit_price,
-                "pnl": pnl,
-            }
+                self.nav += pnl
+                self.pnl_total += pnl
+                self.close(symbol)
+                self.losses += 1
+                self.closed_total += 1
+                return {"result": "SL", "exit": pos.sl, "pnl": pnl, "rr": pos.rr}
+            if low <= pos.tp:
+                pnl = pos.risk_usd * pos.rr
+                self.nav += pnl
+                self.pnl_total += pnl
+                self.close(symbol)
+                self.wins += 1
+                self.closed_total += 1
+                return {"result": "TP", "exit": pos.tp, "pnl": pnl, "rr": pos.rr}
 
         return None
 
-    # ===============================
-    # Performance summary
-    # ===============================
-    def summary(self) -> dict:
-        winrate = (
-            (self.win_trades / self.total_trades) * 100
-            if self.total_trades > 0
-            else 0.0
-        )
-
-        return {
-            "total": self.total_trades,
-            "wins": self.win_trades,
-            "losses": self.loss_trades,
-            "winrate": winrate,
-            "pnl": self.total_pnl,
-            "nav": self.nav,
-        }
-
+    def winrate(self) -> float:
+        return (self.wins / self.closed_total * 100.0) if self.closed_total > 0 else 0.0
 
 
 # ============================================================
@@ -162,7 +166,7 @@ pos_mgr = PositionManager(
     cfg=CFG,
 )
 
-sim = ExecutionSimulator(nav_usd=SIM_START_NAV, rr=SIM_RR)
+sim = ExecutionSimulator(nav_usd=SIM_START_NAV)
 pos_mgr.update_nav(sim.nav)
 
 
@@ -177,13 +181,12 @@ class SymbolState:
 
         self.vol_bucket = 0.0
 
-        # decision TFs
-        self.r5m = TimeframeResampler(5 * 60)    # EARLY (unused in SIM)
-        self.r15m = TimeframeResampler(15 * 60)   # MAIN (for fast test)
+        # MAIN timeframe (CFG.MAIN_TF_SEC, default 15m)
+        self.r_main = TimeframeResampler(int(getattr(CFG, "MAIN_TF_SEC", 15 * 60)))
 
         # history
-        self.candles_15m: List[dict] = []
-        self.volumes_15m: List[float] = []
+        self.candles: List[dict] = []
+        self.volumes: List[float] = []
 
         # cooldown
         self.last_main = 0
@@ -236,8 +239,7 @@ async def ws_bookticker(states: Dict[str, SymbolState], url: str):
 async def notify_regime_change(new_regime: str, reason: str):
     if not bool(int(getattr(CFG, "REGIME_NOTIFY", 1))):
         return
-
-    await send_telegram(
+    await tg_send(
         "📡 MARKET REGIME CHANGED\n"
         f"→ {new_regime}\n"
         f"Reason: {reason}"
@@ -250,65 +252,106 @@ async def notify_regime_change(new_regime: str, reason: str):
 def compute_atr(candles: List[dict], period: int) -> Optional[float]:
     if len(candles) < period + 2:
         return None
-
     atr = ATR(period)
     atr_val = None
     for c in candles:
         atr_val = atr.update(float(c["high"]), float(c["low"]), float(c["close"]))
     return atr_val
 
-# ============================================================
-# Adaptive Entry (NEW)
-# ============================================================
-def compute_adaptive_entry(close_price: float, direction: str) -> float:
-    pullback = float(getattr(CFG, "ENTRY_PULLBACK_PCT", 0.003))
-    breakout = float(getattr(CFG, "ENTRY_BREAKOUT_PCT", 0.0015))
-
-    # TREND → breakout entry
-    if MARKET_REGIME == "TREND":
-        if direction == "LONG":
-            return close_price * (1 + breakout)
-        else:
-            return close_price * (1 - breakout)
-
-    # RANGE/NORMAL → pullback entry
-    elif MARKET_REGIME in ("NORMAL", "RANGE"):
-        if direction == "LONG":
-            return close_price * (1 - pullback)
-        else:
-            return close_price * (1 + pullback)
-
-    # PANIC → breakout only
-    else:
-        if direction == "LONG":
-            return close_price * (1 + breakout)
-        else:
-            return close_price * (1 - breakout)
 
 # ============================================================
-# NAV MONITOR (hourly)
+# Entry confirmation (wait a % move after signal)
+# ============================================================
+def compute_entry_confirm_pct(entry: float, atr_value: float) -> float:
+    atr_pct = atr_value / max(entry, 1e-9)
+    raw = 0.10 * atr_pct
+    lo = float(getattr(CFG, "ENTRY_CONFIRM_MIN_PCT", 0.0003))
+    hi = float(getattr(CFG, "ENTRY_CONFIRM_MAX_PCT", 0.0015))
+    return max(lo, min(hi, raw))
+
+def apply_entry_confirm(entry: float, direction: str, confirm_pct: float) -> float:
+    if direction.upper() == "LONG":
+        return entry * (1.0 + confirm_pct)
+    return entry * (1.0 - confirm_pct)
+
+
+# ============================================================
+# Adaptive RR + SL multiplier (TP/SL adjustment)
+# ============================================================
+def adaptive_rr_and_sl(sig: dict, market_regime: str, market_panic: bool, candle: dict, atr_value: float) -> tuple[float, float, float]:
+    """
+    Returns: (rr, sl_atr_mult, risk_pct_mult)
+    """
+    rr = float(getattr(CFG, "SIM_RR", 2.0))
+    sl_mult = float(getattr(CFG, "SL_ATR_MULT_MAIN", 1.0))
+    risk_mult = 1.0
+
+    o = float(candle["open"])
+    c = float(candle["close"])
+    body_pct = abs(c - o) / max(o, 1e-9)
+    vol_ratio = float(sig.get("volume_ratio", 1.0))
+
+    if sig.get("high_conf"):
+        rr = max(rr, 2.4)
+        risk_mult *= 1.20
+        sl_mult *= 1.05
+
+    if market_regime == "TREND":
+        rr = max(rr, 2.2)
+        risk_mult *= 1.10
+        sl_mult *= 1.05
+
+    if market_regime == "RANGE":
+        rr = min(rr, 1.8)
+        risk_mult *= 0.70
+        sl_mult *= 0.95
+
+    if market_panic:
+        rr = min(rr, 1.7)
+        risk_mult *= 0.60
+        sl_mult *= 1.15
+
+    if vol_ratio >= 4.0:
+        rr = min(3.0, rr + 0.2)
+        risk_mult *= 1.05
+
+    if body_pct >= 0.0075:
+        rr = max(1.5, rr - 0.2)
+        sl_mult *= 1.10
+        risk_mult *= 0.90
+
+    atr_pct = atr_value / max(c, 1e-9)
+    if atr_pct >= 0.02:
+        rr = max(1.5, rr - 0.2)
+        sl_mult *= 1.10
+        risk_mult *= 0.85
+
+    rr = max(1.2, min(3.0, rr))
+    sl_mult = max(0.6, min(1.8, sl_mult))
+    risk_mult = max(0.4, min(1.6, risk_mult))
+    return rr, sl_mult, risk_mult
+
+
+# ============================================================
+# NAV MONITOR (periodic)
 # ============================================================
 async def nav_monitor():
-    interval_sec = int(getattr(CFG, "NAV_REPORT_SEC", 60 * 60))  # default 1h
+    interval_sec = int(getattr(CFG, "NAV_REPORT_SEC", 60 * 60))
     while True:
         await asyncio.sleep(interval_sec)
 
-        total_risk = pos_mgr.total_risk_usd() if hasattr(pos_mgr, "total_risk_usd") else 0.0
-        open_positions = len(sim.positions) if SIM_ENABLED else 0
+        total_risk = pos_mgr.total_risk_usd()
+        open_positions = len(sim.positions)
 
-        stats = sim.summary()
-
-        await send_telegram(
-            f"📊 SIM STATUS\n"
-            f"NAV: {stats['nav']:.2f} USDT\n"
-            f"Open positions: {len(sim.positions)}\n"
+        await tg_send(
+            "📊 SIM STATUS\n"
+            f"NAV: {sim.nav:.2f} USDT\n"
+            f"Open positions: {open_positions}\n"
             f"Total risk: {total_risk:.2f} USDT\n"
-            f"Regime: {MARKET_REGIME}\n\n"
-            f"📈 Performance:\n"
-            f"Trades: {stats['total']}\n"
-            f"Wins: {stats['wins']} | Losses: {stats['losses']}\n"
-            f"Winrate: {stats['winrate']:.2f}%\n"
-            f"Total PnL: {stats['pnl']:.2f} USDT"
+            f"Trades: {sim.trades_total} | Closed: {sim.closed_total}\n"
+            f"Wins: {sim.wins} | Losses: {sim.losses} | Winrate: {sim.winrate():.1f}%\n"
+            f"PnL total: {sim.pnl_total:.2f} USDT\n"
+            f"Regime: {MARKET_REGIME} | Panic: {MARKET_PANIC}"
         )
 
 
@@ -316,10 +359,11 @@ async def nav_monitor():
 # WS: AGG TRADE (engine)
 # ============================================================
 async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
-    await send_telegram(
+    tf_sec = int(getattr(CFG, "MAIN_TF_SEC", 15 * 60))
+    await tg_send(
         "✅ SIM TRADING BOT RUNNING\n"
-        f"symbols={len(states)} | MAIN=1m(test)\n"
-        f"SIM={'ON' if SIM_ENABLED else 'OFF'} | NAV={sim.nav:.2f} | RR={SIM_RR}"
+        f"symbols={len(states)} | MAIN={tf_sec}s\n"
+        f"SIM={'ON' if SIM_ENABLED else 'OFF'} | NAV={sim.nav:.2f} | BaseRR={SIM_RR}"
     )
 
     if "BTCUSDT" not in states or "ETHUSDT" not in states:
@@ -375,8 +419,8 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                             await notify_regime_change(rr.regime, rr.reason)
                                             LAST_REGIME = rr.regime
 
-                                # ================= MAIN (1m test) =================
-                                closed, did = st.r15m.update(st.cur_sec, mid, st.vol_bucket)
+                                # ================= MAIN candle =================
+                                closed, did = st.r_main.update(st.cur_sec, mid, st.vol_bucket)
                                 if did and closed:
                                     candle = {
                                         "open": closed.open,
@@ -384,49 +428,36 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                         "low": closed.low,
                                         "close": closed.close,
                                     }
-                                    st.candles_15m.append(candle)
-                                    st.volumes_15m.append(closed.volume)
-                                    st.candles_15m = st.candles_15m[-300:]
-                                    st.volumes_15m = st.volumes_15m[-300:]
+                                    st.candles.append(candle)
+                                    st.volumes.append(closed.volume)
+                                    st.candles = st.candles[-300:]
+                                    st.volumes = st.volumes[-300:]
 
                                     # ---- SIM: update existing position first ----
                                     if SIM_ENABLED:
-                                        try:
-                                            close_info = sim.update_by_candle(sym, candle)
-                                            if close_info:
-                                                pos_mgr.close_position(sym)
-                                                pos_mgr.update_nav(sim.nav)
+                                        close_info = sim.update_by_candle(sym, candle)
+                                        if close_info:
+                                            pos_mgr.close_position(sym)
+                                            pos_mgr.update_nav(sim.nav)
 
-                                                exit_price = close_info.get("exit")
-                                                pnl = close_info.get("pnl")
+                                            exit_price = float(close_info["exit"])
+                                            pnl = float(close_info["pnl"])
 
-                                                exit_str = f"{exit_price:.6f}" if isinstance(exit_price, (int, float)) else "None"
-                                                pnl_str = f"{pnl:.2f}" if isinstance(pnl, (int, float)) else "0.00"
-
-                                                stats = sim.summary()
-
-                                                await send_telegram(
-                                                    f"🔴 CLOSE {sym}\n"
-                                                    f"Exit: {exit_str}\n"
-                                                    f"Result: {close_info.get('result')}\n"
-                                                    f"PnL: {pnl_str} USDT\n"
-                                                    f"NAV: {sim.nav:.2f} USDT\n\n"
-                                                    f"📊 Stats:\n"
-                                                    f"Trades: {stats['total']} | Wins: {stats['wins']} | Loss: {stats['losses']}\n"
-                                                    f"Winrate: {stats['winrate']:.2f}% | Total PnL: {stats['pnl']:.2f} USDT"
-                                                )
-
-                                        except Exception as e:
-                                            print("[CLOSE ERROR]", sym, e)
-                                            await send_telegram(f"⚠️ CLOSE ERROR {sym}: {e}")
+                                            await tg_send(
+                                                f"🔴 CLOSE {sym}\n"
+                                                f"Exit: {exit_price:.6f}\n"
+                                                f"Result: {close_info['result']}\n"
+                                                f"PnL: {pnl:.2f} USDT\n"
+                                                f"NAV: {sim.nav:.2f} USDT"
+                                            )
 
                                     # ---- Decide open new trade only on candle close ----
                                     now = int(time.time())
                                     if now - st.last_main >= int(getattr(CFG, "COOLDOWN_SEC_MAIN", 60)):
                                         sig = check_signal(
                                             sym,
-                                            st.candles_15m,
-                                            st.volumes_15m,
+                                            st.candles,
+                                            st.volumes,
                                             st.spread(),
                                             mode="main",
                                             market_regime=MARKET_REGIME,
@@ -446,109 +477,85 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 st.cur_sec += 1
                                                 continue
 
-                                            atr_val = compute_atr(st.candles_15m, int(getattr(CFG, "ATR_SHORT", 14)))
+                                            atr_val = compute_atr(st.candles, int(getattr(CFG, "ATR_SHORT", 14)))
                                             if atr_val is None:
                                                 st.vol_bucket = 0.0
                                                 st.cur_sec += 1
                                                 continue
 
-                                            base_nav = sim.nav
+                                            close_px = float(candle["close"])
+                                            liq_usd = float(closed.volume) * close_px
+                                            min_liq = float(getattr(CFG, "MIN_LIQUIDITY_USD", 0.0))
+                                            if min_liq > 0 and liq_usd < min_liq:
+                                                st.vol_bucket = 0.0
+                                                st.cur_sec += 1
+                                                continue
 
-                                            risk_multiplier = 1.0
+                                            rr, sl_mult, risk_mult = adaptive_rr_and_sl(sig, MARKET_REGIME, MARKET_PANIC, candle, float(atr_val))
 
-                                            # High confidence → tăng risk
-                                            if sig.get("high_conf"):
-                                                risk_multiplier *= 1.3
-
-                                            # Regime trend → tăng nhẹ
-                                            if MARKET_REGIME == "TREND":
-                                                risk_multiplier *= 1.2
-
-                                            # Regime range → giảm risk
-                                            if MARKET_REGIME == "RANGE":
-                                                risk_multiplier *= 0.6
-
-                                            # Regime panic → giảm mạnh
-                                            if MARKET_PANIC:
-                                                risk_multiplier *= 0.5
-
-                                            # ======================
-                                            # Adaptive RR
-                                            # ======================
-                                            rr = SIM_RR  # default
-
-                                            if sig.get("high_conf"):
-                                                rr = 2.5
-                                            elif MARKET_REGIME == "TREND":
-                                                rr = 2.2
-                                            else:
-                                                rr = 1.8
-
-                                            entry_price = compute_adaptive_entry(
-                                                float(closed.close),
-                                                sig["direction"],
-                                            )
+                                            confirm_pct = compute_entry_confirm_pct(close_px, float(atr_val))
+                                            planned_entry = apply_entry_confirm(close_px, sig["direction"], confirm_pct)
 
                                             rp = build_risk_plan(
                                                 symbol=sym,
                                                 direction=sig["direction"],
-                                                entry=entry_price,
+                                                entry=float(planned_entry),
                                                 atr_value=float(atr_val),
                                                 nav_usd=float(sim.nav),
                                                 mode="main",
                                                 cfg=CFG,
-                                                rr=rr,
+                                                rr=float(rr),
+                                                risk_pct_mult=float(risk_mult),
+                                                sl_atr_mult=float(sl_mult),
                                             )
 
                                             ok, reason = pos_mgr.can_open(
                                                 symbol=sym,
                                                 risk_usd=float(rp.risk_usd),
-                                                new_prices=[c["close"] for c in st.candles_15m[-60:]],
+                                                new_prices=[c["close"] for c in st.candles[-60:]],
                                             )
                                             if not ok:
                                                 st.vol_bucket = 0.0
                                                 st.cur_sec += 1
                                                 continue
 
-                                            # ---- SIM open ----
-                                            if SIM_ENABLED:
-                                                try:
-                                                    sim.open(
-                                                        SimPosition(
-                                                            symbol=sym,
-                                                            direction=sig["direction"],
-                                                            qty=float(rp.qty),
-                                                            entry=float(rp.entry),
-                                                            sl=float(rp.sl),
-                                                            tp=float(rp.tp),
-                                                            risk_usd=float(rp.risk_usd),
-                                                            opened_at=time.time(),
-                                                        )
-                                                    )
+                                            sim.open(
+                                                SimPosition(
+                                                    symbol=sym,
+                                                    direction=rp.direction,
+                                                    qty=float(rp.qty),
+                                                    entry=float(rp.entry),
+                                                    sl=float(rp.sl),
+                                                    tp=float(rp.tp) if rp.tp is not None else float(rp.entry),
+                                                    risk_usd=float(rp.risk_usd),
+                                                    rr=float(rp.rr),
+                                                    opened_at=time.time(),
+                                                )
+                                            )
 
-                                                    pos_mgr.open_position(
-                                                        symbol=sym,
-                                                        direction=sig["direction"],
-                                                        qty=float(rp.qty),
-                                                        entry=float(rp.entry),
-                                                        sl=float(rp.sl),
-                                                        tp=float(rp.tp) if rp.tp is not None else None,
-                                                        risk_usd=float(rp.risk_usd),
-                                                        price_history=[c["close"] for c in st.candles_15m[-60:]],
-                                                    )
-                                                    pos_mgr.update_nav(sim.nav)
+                                            pos_mgr.open_position(
+                                                symbol=sym,
+                                                direction=rp.direction,
+                                                qty=float(rp.qty),
+                                                entry=float(rp.entry),
+                                                sl=float(rp.sl),
+                                                tp=float(rp.tp) if rp.tp is not None else None,
+                                                risk_usd=float(rp.risk_usd),
+                                                price_history=[c["close"] for c in st.candles[-60:]],
+                                            )
+                                            pos_mgr.update_nav(sim.nav)
 
-                                                    await send_telegram(
-                                                        f"🟢 OPEN {sig['direction']} {sym}\n"
-                                                        f"Entry: {rp.entry:.6f}\n"
-                                                        f"Qty: {rp.qty:.4f}\n"
-                                                        f"SL: {rp.sl:.6f}\n"
-                                                        f"TP: {rp.tp:.6f}\n"
-                                                        f"NAV: {sim.nav:.2f} USDT"
-                                                    )
-                                                except Exception as e:
-                                                    print("[OPEN ERROR]", sym, e)
-                                                    await send_telegram(f"⚠️ OPEN ERROR {sym}: {e}")
+                                            await tg_send(
+                                                f"🟢 OPEN {rp.direction} {sym}\n"
+                                                f"Entry: {rp.entry:.6f} (confirm {confirm_pct*100:.2f}%)\n"
+                                                f"Qty: {rp.qty:.4f}\n"
+                                                f"SL: {rp.sl:.6f} (ATR*{rp.sl_atr_mult:.2f})\n"
+                                                f"TP: {rp.tp:.6f} (RR={rp.rr:.2f})\n"
+                                                f"Risk: {rp.risk_usd:.2f} USDT ({rp.risk_pct:.2f}%)\n"
+                                                f"NAV: {sim.nav:.2f} USDT\n"
+                                                f"Regime: {MARKET_REGIME} | Panic: {MARKET_PANIC}\n"
+                                                f"vol={sig.get('volume_ratio', 0):.2f}x | gap={sig.get('ema_gap', 0)*100:.2f}%"
+                                            )
 
                                 st.vol_bucket = 0.0
 
@@ -572,6 +579,7 @@ async def main():
     url_trade = ws_base + "?streams=" + "/".join(f"{s.lower()}@aggTrade" for s in states)
 
     await asyncio.gather(
+        tg_worker(),
         ws_bookticker(states, url_book),
         ws_aggtrade(states, url_trade),
         nav_monitor(),

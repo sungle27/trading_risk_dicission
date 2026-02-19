@@ -3,205 +3,141 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-
+# ============================================================
+# Risk Plan
+# ============================================================
 @dataclass(frozen=True)
 class RiskPlan:
-    # sizing
-    nav_usd: float
-    risk_pct: float          # % NAV (base, before vol-adjust)
-    risk_usd: float          # after vol-adjust sizing
-
-    # prices (filled/assumed)
-    entry: float             # effective entry (after slippage)
+    symbol: str
+    direction: str          # "LONG" | "SHORT"
+    entry: float            # effective entry (after confirmation+slippage)
     sl: float
     tp: Optional[float]
-
-    # distance
-    atr_value: float
-    atr_pct: float
-    sl_dist: float
-    rr: float
-
-    # quantity (coin units)
     qty: float
 
-    # slippage metadata
-    slippage_pct: float
-    position_notional_usd: float
+    rr: float               # take-profit RR used
+    risk_usd: float
+    risk_pct: float
 
-    # misc
-    note: str
+    sl_atr_mult: float
+    atr_value: float
+    atr_pct: float
 
+    notes: str = ""
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+def _slippage_bps_for(mode: str, cfg) -> float:
+    if mode == "early":
+        return float(getattr(cfg, "ENTRY_SLIPPAGE_BPS_EARLY", 4.0))
+    return float(getattr(cfg, "ENTRY_SLIPPAGE_BPS_MAIN", 2.0))
 
-def _infer_side(direction: str) -> str:
-    d = (direction or "").upper().strip()
-    return d if d in ("LONG", "SHORT") else "LONG"
-
-
-def _getf(cfg, key: str, default: float) -> float:
-    try:
-        return float(getattr(cfg, key))
-    except Exception:
-        return float(default)
-
-
-def _geti(cfg, key: str, default: int) -> int:
-    try:
-        return int(getattr(cfg, key))
-    except Exception:
-        return int(default)
-
+def _sl_atr_mult_for(mode: str, cfg) -> float:
+    if mode == "early":
+        return float(getattr(cfg, "SL_ATR_MULT_EARLY", 0.9))
+    return float(getattr(cfg, "SL_ATR_MULT_MAIN", 1.0))
 
 def build_risk_plan(
     *,
     symbol: str,
     direction: str,
-    entry: float,                 # signal price (close candle)
-    atr_value: float,             # ATR in price units (same scale as entry)
+    entry: float,
+    atr_value: float,
     nav_usd: float,
     mode: str,
     cfg,
-    spread_pct: float = 0.0,       # e.g. 0.0018 (0.18%)
-    avg_volume_usd: float = 0.0,   # average traded USD volume (same timeframe as signal)
-    rr: Optional[float] = None,
+    rr: float = 2.0,
+    risk_pct_mult: float = 1.0,
+    sl_atr_mult: Optional[float] = None,
+    entry_slippage_bps: Optional[float] = None,
 ) -> RiskPlan:
     """
-    Build a risk plan with:
-    - ATR-based SL
-    - Volatility-adjusted sizing (risk_usd shrinks when ATR% rises)
-    - Slippage-adjusted entry estimate (spread + ATR + market impact vs liquidity)
-
-    Required cfg fields (recommended):
-      RISK_EARLY / RISK_MAIN (% NAV)
-      RISK_MAX (% NAV cap)
-      SL_ATR_MULT
-      TP_RR
-      TARGET_VOL_PCT (e.g. 0.015 means 1.5% ATR target)
-      ENABLE_SLIPPAGE_MODEL (0/1)
-      SLIP_K_ATR, SLIP_K_IMPACT (optional tuning)
+    Core sizing:
+    - Base risk per trade (%NAV) with optional volatility adjustment
+    - SL distance = ATR * SL_ATR_MULT
+    - Qty = risk_usd / SL_distance
+    - TP uses RR: TP_distance = SL_distance * RR
     """
 
-    # -------- Imports placed inside to avoid import issues at startup
-    from app.volatility_sizing import volatility_adjusted_risk
-    from app.slippage_model import estimate_slippage_pct
+    entry = float(entry)
+    atr_value = float(atr_value)
+    nav_usd = float(nav_usd)
 
-    side = _infer_side(direction)
-    m = (mode or "early").lower().strip()
+    if entry <= 0 or atr_value <= 0 or nav_usd <= 0:
+        raise ValueError("Invalid entry/atr/nav")
 
-    if entry <= 0:
-        raise ValueError("entry must be > 0")
+    # Base risk (% NAV)
+    base_risk_pct = float(getattr(cfg, "RISK_PER_TRADE_PCT", 0.25))
+    risk_pct = base_risk_pct * float(risk_pct_mult)
 
-    # -----------------------------
-    # 1) Base risk pct by mode (% NAV)
-    # -----------------------------
-    if m == "early":
-        base_risk_pct = _getf(cfg, "RISK_EARLY", 0.25)
+    # Volatility-adjust sizing (optional)
+    if int(getattr(cfg, "ENABLE_VOL_ADJ_SIZING", 1)) == 1:
+        atr_pct = atr_value / entry
+        target = float(getattr(cfg, "TARGET_VOL_PCT", 0.010))
+        scale = target / max(1e-9, atr_pct)
+        scale = _clamp(scale, 0.5, 1.5)
+        risk_pct *= scale
     else:
-        base_risk_pct = _getf(cfg, "RISK_MAIN", 0.50)
+        atr_pct = atr_value / entry
 
-    risk_max = _getf(cfg, "RISK_MAX", 1.0)
-    base_risk_pct = _clamp(base_risk_pct, 0.01, risk_max)
+    # Clamp risk % to sane band
+    risk_pct = _clamp(risk_pct, 0.05, 2.0)
 
-    # -----------------------------
-    # 2) Volatility-adjusted risk USD
-    #    risk_usd = nav * (base_risk_pct/100) * min(1, target_vol/atr_pct)
-    # -----------------------------
-    atr_pct = (atr_value / entry) if atr_value > 0 else 0.0
-    target_vol_pct = _getf(cfg, "TARGET_VOL_PCT", 0.015)
+    # SL distance
+    if sl_atr_mult is None:
+        sl_atr_mult = _sl_atr_mult_for(mode, cfg)
+    sl_atr_mult = float(sl_atr_mult)
 
-    risk_usd = volatility_adjusted_risk(
-        nav_usd=nav_usd,
-        base_risk_pct=(base_risk_pct / 100.0),
-        atr_pct=atr_pct,
-        target_vol_pct=target_vol_pct,
-    )
+    sl_dist = atr_value * sl_atr_mult
+    sl_dist = max(sl_dist, entry * 0.0002)  # prevent ultra-tight stops on micro ATR
 
-    # Safety clamp
-    if risk_usd < 0:
-        risk_usd = 0.0
+    # Risk USD
+    risk_usd = nav_usd * (risk_pct / 100.0)
 
-    # -----------------------------
-    # 3) SL distance from ATR
-    # -----------------------------
-    sl_mult = _getf(cfg, "SL_ATR_MULT", 1.5)
-    sl_dist = max(atr_value * sl_mult, entry * 0.001)  # >= 0.1% fallback
+    # Qty
+    qty = risk_usd / sl_dist
+    qty = max(qty, 0.0)
 
-    # SL level based on signal entry (pre-slippage)
-    if side == "LONG":
-        sl = max(0.0, entry - sl_dist)
+    # TP
+    rr = float(rr)
+    rr = _clamp(rr, 1.2, 3.0)
+    tp_dist = sl_dist * rr
+
+    if direction.upper() == "LONG":
+        sl = entry - sl_dist
+        tp = entry + tp_dist
     else:
         sl = entry + sl_dist
+        tp = entry - tp_dist
 
-    # -----------------------------
-    # 4) Slippage model → effective entry (fill estimate)
-    # -----------------------------
-    enable_slippage = _geti(cfg, "ENABLE_SLIPPAGE_MODEL", 1) == 1
+    # Slippage on entry (bps)
+    if entry_slippage_bps is None:
+        entry_slippage_bps = _slippage_bps_for(mode, cfg)
+    bps = float(entry_slippage_bps)
 
-    # First pass qty estimate without slippage (to compute notional impact)
-    per_unit_risk0 = abs(entry - sl)
-    qty0 = (risk_usd / per_unit_risk0) if per_unit_risk0 > 0 else 0.0
-    position_notional0 = qty0 * entry
-
-    slippage_pct = 0.0
-    eff_entry = entry
-
-    if enable_slippage:
-        slippage_pct = estimate_slippage_pct(
-            spread_pct=float(spread_pct),
-            atr_pct=float(atr_pct),
-            position_notional_usd=float(position_notional0),
-            avg_volume_usd=float(avg_volume_usd),
-        )
-        slippage_pct = max(0.0, slippage_pct)
-
-        if side == "LONG":
-            eff_entry = entry * (1.0 + slippage_pct)
-        else:
-            eff_entry = entry * (1.0 - slippage_pct)
-
-    # -----------------------------
-    # 5) Quantity recompute using eff_entry vs SL
-    #    (keeps risk_usd stable after slippage)
-    # -----------------------------
-    per_unit_risk = abs(eff_entry - sl)
-    qty = (risk_usd / per_unit_risk) if per_unit_risk > 0 else 0.0
-    position_notional = qty * eff_entry
-
-    # -----------------------------
-    # 6) TP by RR (optional)
-    # -----------------------------
-    rr_val = float(rr if rr is not None else _getf(cfg, "TP_RR", 2.0))
-    if rr_val <= 0:
-        tp = None
+    if direction.upper() == "LONG":
+        eff_entry = entry * (1.0 + bps / 10000.0)
     else:
-        if side == "LONG":
-            tp = eff_entry + rr_val * (eff_entry - sl)
-        else:
-            tp = eff_entry - rr_val * (sl - eff_entry)
+        eff_entry = entry * (1.0 - bps / 10000.0)
 
-    note = (
-        f"{symbol} {side} | mode={m} | base_risk={base_risk_pct:.2f}% "
-        f"| risk_usd={risk_usd:.2f} | atr={atr_value:.6f} ({atr_pct*100:.2f}%) "
-        f"| sl_mult={sl_mult} rr={rr_val} | slip={slippage_pct*100:.2f}%"
-    )
+    # Shift SL/TP by the same entry delta (keep distances)
+    delta = eff_entry - entry
+    sl += delta
+    tp = tp + delta if tp is not None else None
 
     return RiskPlan(
-        nav_usd=nav_usd,
-        risk_pct=base_risk_pct,
-        risk_usd=risk_usd,
-        entry=eff_entry,
-        sl=sl,
-        tp=tp,
-        atr_value=atr_value,
-        atr_pct=atr_pct,
-        sl_dist=sl_dist,
-        rr=rr_val,
-        qty=qty,
-        slippage_pct=slippage_pct,
-        position_notional_usd=position_notional,
-        note=note,
+        symbol=symbol,
+        direction=direction.upper(),
+        entry=float(eff_entry),
+        sl=float(sl),
+        tp=float(tp) if tp is not None else None,
+        qty=float(qty),
+        rr=float(rr),
+        risk_usd=float(risk_usd),
+        risk_pct=float(risk_pct),
+        sl_atr_mult=float(sl_atr_mult),
+        atr_value=float(atr_value),
+        atr_pct=float(atr_pct),
+        notes="vol_adj=on" if int(getattr(cfg, "ENABLE_VOL_ADJ_SIZING", 1)) == 1 else "vol_adj=off",
     )
