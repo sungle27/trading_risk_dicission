@@ -59,6 +59,12 @@ class ExecutionSimulator:
         self.base_rr = float(rr)
         self.positions: Dict[str, SimPosition] = {}
 
+        # ==== STAT TRACKING ====
+        self.total_trades = 0
+        self.win_trades = 0
+        self.loss_trades = 0
+        self.total_pnl = 0.0
+
     def has_pos(self, symbol: str) -> bool:
         return symbol in self.positions
 
@@ -71,10 +77,6 @@ class ExecutionSimulator:
         return None
 
     def update_by_candle(self, symbol: str, candle: dict) -> Optional[dict]:
-        """
-        Check SL/TP using candle high/low.
-        Return dict: { "result": "SL"/"TP", "exit": float, "pnl": float } if closed, else None.
-        """
         pos = self.positions.get(symbol)
         if not pos:
             return None
@@ -82,33 +84,71 @@ class ExecutionSimulator:
         high = float(candle["high"])
         low = float(candle["low"])
 
+        result = None
+        exit_price = None
+        pnl = 0.0
+
         # LONG
         if pos.direction == "LONG":
             if low <= pos.sl:
                 pnl = -pos.risk_usd
-                self.nav += pnl
-                self.close(symbol)
-                return {"result": "SL", "exit": pos.sl, "pnl": pnl}
-            if high >= pos.tp:
-                pnl = pos.risk_usd * self.rr
-                self.nav += pnl
-                self.close(symbol)
-                return {"result": "TP", "exit": pos.tp, "pnl": pnl}
+                exit_price = pos.sl
+                result = "SL"
+            elif high >= pos.tp:
+                pnl = pos.risk_usd * self.base_rr
+                exit_price = pos.tp
+                result = "TP"
 
         # SHORT
         else:
             if high >= pos.sl:
                 pnl = -pos.risk_usd
-                self.nav += pnl
-                self.close(symbol)
-                return {"result": "SL", "exit": pos.sl, "pnl": pnl}
-            if low <= pos.tp:
-                pnl = pos.risk_usd * self.rr
-                self.nav += pnl
-                self.close(symbol)
-                return {"result": "TP", "exit": pos.tp, "pnl": pnl}
+                exit_price = pos.sl
+                result = "SL"
+            elif low <= pos.tp:
+                pnl = pos.risk_usd * self.base_rr
+                exit_price = pos.tp
+                result = "TP"
+
+        if result:
+            self.nav += pnl
+            self.total_trades += 1
+            self.total_pnl += pnl
+
+            if pnl > 0:
+                self.win_trades += 1
+            else:
+                self.loss_trades += 1
+
+            self.close(symbol)
+
+            return {
+                "result": result,
+                "exit": exit_price,
+                "pnl": pnl,
+            }
 
         return None
+
+    # ===============================
+    # Performance summary
+    # ===============================
+    def summary(self) -> dict:
+        winrate = (
+            (self.win_trades / self.total_trades) * 100
+            if self.total_trades > 0
+            else 0.0
+        )
+
+        return {
+            "total": self.total_trades,
+            "wins": self.win_trades,
+            "losses": self.loss_trades,
+            "winrate": winrate,
+            "pnl": self.total_pnl,
+            "nav": self.nav,
+        }
+
 
 
 # ============================================================
@@ -256,12 +296,19 @@ async def nav_monitor():
         total_risk = pos_mgr.total_risk_usd() if hasattr(pos_mgr, "total_risk_usd") else 0.0
         open_positions = len(sim.positions) if SIM_ENABLED else 0
 
+        stats = sim.summary()
+
         await send_telegram(
             f"📊 SIM STATUS\n"
-            f"NAV: {sim.nav:.2f} USDT\n"
-            f"Open positions: {open_positions}\n"
+            f"NAV: {stats['nav']:.2f} USDT\n"
+            f"Open positions: {len(sim.positions)}\n"
             f"Total risk: {total_risk:.2f} USDT\n"
-            f"Regime: {MARKET_REGIME}"
+            f"Regime: {MARKET_REGIME}\n\n"
+            f"📈 Performance:\n"
+            f"Trades: {stats['total']}\n"
+            f"Wins: {stats['wins']} | Losses: {stats['losses']}\n"
+            f"Winrate: {stats['winrate']:.2f}%\n"
+            f"Total PnL: {stats['pnl']:.2f} USDT"
         )
 
 
@@ -356,13 +403,19 @@ async def ws_aggtrade(states: Dict[str, SymbolState], url: str):
                                                 exit_str = f"{exit_price:.6f}" if isinstance(exit_price, (int, float)) else "None"
                                                 pnl_str = f"{pnl:.2f}" if isinstance(pnl, (int, float)) else "0.00"
 
+                                                stats = sim.summary()
+
                                                 await send_telegram(
                                                     f"🔴 CLOSE {sym}\n"
                                                     f"Exit: {exit_str}\n"
                                                     f"Result: {close_info.get('result')}\n"
                                                     f"PnL: {pnl_str} USDT\n"
-                                                    f"NAV: {sim.nav:.2f} USDT"
+                                                    f"NAV: {sim.nav:.2f} USDT\n\n"
+                                                    f"📊 Stats:\n"
+                                                    f"Trades: {stats['total']} | Wins: {stats['wins']} | Loss: {stats['losses']}\n"
+                                                    f"Winrate: {stats['winrate']:.2f}% | Total PnL: {stats['pnl']:.2f} USDT"
                                                 )
+
                                         except Exception as e:
                                             print("[CLOSE ERROR]", sym, e)
                                             await send_telegram(f"⚠️ CLOSE ERROR {sym}: {e}")

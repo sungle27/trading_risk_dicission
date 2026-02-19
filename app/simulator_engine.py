@@ -83,11 +83,18 @@ class Simulator:
 
         self.nav += pnl
 
+        stats = sim.summary()
+
         await send_telegram(
-            f"🔴 CLOSE {p['direction']} {symbol}\n"
-            f"Exit: {exit_price:.6f}\n"
-            f"PnL: {pnl:.2f} USDT\n"
-            f"NAV: {self.nav:.2f} USDT"
+            f"🔴 CLOSE {sym}\n"
+            f"Exit: {exit_str}\n"
+            f"Result: {close_info.get('result')}\n"
+            f"PnL: {pnl_str} USDT\n"
+            f"NAV: {sim.nav:.2f} USDT\n\n"
+            f"📊 Stats:\n"
+            f"Trades: {stats['total']} | Wins: {stats['wins']} | Loss: {stats['losses']}\n"
+            f"Winrate: {stats['winrate']:.2f}% | Total PnL: {stats['pnl']:.2f} USDT"
         )
+
 
         del self.positions[symbol]

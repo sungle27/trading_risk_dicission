@@ -16,53 +16,97 @@ class SimPosition:
 
 
 class ExecutionSimulator:
-
-    def __init__(self, nav_usd: float):
-        self.nav = nav_usd
+    def __init__(self, nav_usd: float, rr: float = 2.0):
+        self.nav = float(nav_usd)
+        self.base_rr = float(rr)
         self.positions: Dict[str, SimPosition] = {}
 
-    # --------------------------------------------------
-    # OPEN POSITION
-    # --------------------------------------------------
-    def open_position(self, pos: SimPosition):
+        # ==== STAT TRACKING ====
+        self.total_trades = 0
+        self.win_trades = 0
+        self.loss_trades = 0
+        self.total_pnl = 0.0
+
+    def has_pos(self, symbol: str) -> bool:
+        return symbol in self.positions
+
+    def open(self, pos: SimPosition) -> None:
         self.positions[pos.symbol] = pos
 
-    # --------------------------------------------------
-    # UPDATE POSITIONS (called every candle close)
-    # --------------------------------------------------
-    def update(self, symbol: str, candle: dict):
-        if symbol not in self.positions:
+    def close(self, symbol: str) -> Optional[SimPosition]:
+        if symbol in self.positions:
+            return self.positions.pop(symbol)
+        return None
+
+    def update_by_candle(self, symbol: str, candle: dict) -> Optional[dict]:
+        pos = self.positions.get(symbol)
+        if not pos:
             return None
 
-        pos = self.positions[symbol]
+        high = float(candle["high"])
+        low = float(candle["low"])
 
-        high = candle["high"]
-        low = candle["low"]
+        result = None
+        exit_price = None
+        pnl = 0.0
 
         # LONG
         if pos.direction == "LONG":
-
             if low <= pos.sl:
-                self.nav -= pos.risk_usd
-                del self.positions[symbol]
-                return "SL"
-
-            if high >= pos.tp:
-                self.nav += pos.risk_usd * 2
-                del self.positions[symbol]
-                return "TP"
+                pnl = -pos.risk_usd
+                exit_price = pos.sl
+                result = "SL"
+            elif high >= pos.tp:
+                pnl = pos.risk_usd * self.base_rr
+                exit_price = pos.tp
+                result = "TP"
 
         # SHORT
         else:
-
             if high >= pos.sl:
-                self.nav -= pos.risk_usd
-                del self.positions[symbol]
-                return "SL"
+                pnl = -pos.risk_usd
+                exit_price = pos.sl
+                result = "SL"
+            elif low <= pos.tp:
+                pnl = pos.risk_usd * self.base_rr
+                exit_price = pos.tp
+                result = "TP"
 
-            if low <= pos.tp:
-                self.nav += pos.risk_usd * 2
-                del self.positions[symbol]
-                return "TP"
+        if result:
+            self.nav += pnl
+            self.total_trades += 1
+            self.total_pnl += pnl
+
+            if pnl > 0:
+                self.win_trades += 1
+            else:
+                self.loss_trades += 1
+
+            self.close(symbol)
+
+            return {
+                "result": result,
+                "exit": exit_price,
+                "pnl": pnl,
+            }
 
         return None
+
+    # ===============================
+    # Performance summary
+    # ===============================
+    def summary(self) -> dict:
+        winrate = (
+            (self.win_trades / self.total_trades) * 100
+            if self.total_trades > 0
+            else 0.0
+        )
+
+        return {
+            "total": self.total_trades,
+            "wins": self.win_trades,
+            "losses": self.loss_trades,
+            "winrate": winrate,
+            "pnl": self.total_pnl,
+            "nav": self.nav,
+        }
